@@ -1,0 +1,150 @@
+---
+title: "Nucleotide Composition Analysis for the 500 Most Expressed Genes"
+author: "Sadhana Chidambaran"
+output: html_document
+---
+
+```{r echo = FALSE}
+knitr::opts_chunk$set(fig.align = "center", warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r, message = FALSE}
+library(Biostrings)
+library(ggpubr)
+library(ggseqlogo)
+library(tidyverse)
+```
+
+Function to create sequence logo from FASTA
+```{r}
+seq.logo <- function(file) {
+  
+  threshold <- str_split(file, "/")[[1]] %>% 
+    tail(n = 1) %>% 
+    str_split(., "_")
+  threshold <- gsub(".fasta", "", tail(threshold[[1]], n = 1))
+  
+  readDNAStringSet(file) %>% 
+    consensusMatrix(baseOnly = TRUE) %>% 
+    ggseqlogo() + 
+    ggtitle(threshold) + 
+    theme(plot.title = element_text(hjust = 0.5))
+}
+```
+
+Get all files
+```{r}
+seqs.5.ends.edge <- grep("seqs_5_ends_edge", 
+                         dir("/data/sadhana/rnaseq_bias/fastas/500_genes", full.names = TRUE), 
+                         value = TRUE)
+seqs.5.ends <- grep("seqs_5_ends", 
+                    dir("/data/sadhana/rnaseq_bias/fastas/500_genes", full.names = TRUE), 
+                    value = TRUE) %>% 
+  setdiff(seqs.5.ends.edge)
+
+seqs.3.ends.edge <- grep("seqs_3_ends_edge", 
+                         dir("/data/sadhana/rnaseq_bias/fastas/500_genes", full.names = TRUE), 
+                         value = TRUE)
+seqs.3.ends <- grep("seqs_3_ends", 
+                    dir("/data/sadhana/rnaseq_bias/fastas/500_genes", full.names = TRUE), 
+                    value = TRUE) %>% 
+  setdiff(seqs.3.ends.edge)
+
+rand.5.ends.edge <- grep("rand_5_ends_edge", 
+                         dir("/data/sadhana/rnaseq_bias/fastas/500_genes", full.names = TRUE), 
+                         value = TRUE)
+rand.5.ends <- grep("rand_5_ends", 
+                    dir("/data/sadhana/rnaseq_bias/fastas/500_genes", full.names = TRUE), 
+                    value = TRUE) %>% 
+  setdiff(rand.5.ends.edge)
+
+rand.3.ends.edge <- grep("rand_3_ends_edge", 
+                         dir("/data/sadhana/rnaseq_bias/fastas/500_genes", full.names = TRUE), 
+                         value = TRUE)
+rand.3.ends <- grep("rand_3_ends", 
+                    dir("/data/sadhana/rnaseq_bias/fastas/500_genes", full.names = TRUE), 
+                    value = TRUE) %>% 
+  setdiff(rand.3.ends.edge)
+```
+
+### 5' read ends for 500 most expressed genes
+
+Read in FASTAs and create sequence logos for the 30 bp sequences at regions of low fragmentation
+```{r}
+lapply(seqs.5.ends, seq.logo)
+```
+
+Read in FASTAs and create sequence logos for randomly selected 30 bp sequences
+```{r}
+lapply(rand.5.ends, seq.logo)
+```
+
+Read in FASTAs and create sequence logos for 5' edge of 30 bp sequences at regions of low fragmentation
+```{r}
+lapply(seqs.5.ends.edge, seq.logo)
+```
+
+Read in FASTAs and create sequence logos for 5' edge of randomly selected 30 bp sequences
+```{r}
+lapply(rand.5.ends.edge, seq.logo)
+```
+
+### 3' read ends for 500 most expressed genes
+
+Read in FASTAs and create sequence logos for the 30 bp sequences at regions of low fragmentation
+```{r}
+lapply(seqs.3.ends, seq.logo)
+```
+
+Read in FASTAs and create sequence logos for randomly selected 30 bp sequences
+```{r}
+lapply(rand.3.ends, seq.logo)
+```
+
+Read in FASTAs and create sequence logos for 3' edge of 30 bp sequences at regions of low fragmentation
+```{r}
+lapply(seqs.3.ends.edge, seq.logo)
+```
+
+Read in FASTAs and create sequence logos for 3' edge of randomly selected 30 bp sequences
+```{r}
+lapply(rand.3.ends.edge, seq.logo)
+```
+
+### 0.005 threshold sequence logos
+
+```{r}
+blocks.logos <- ggarrange(seq.logo(grep("0.005", seqs.5.ends, value = TRUE)) + 
+                            ylim(0, 0.35) + 
+                            ggtitle("Blocks") + 
+                            theme(text = element_text(size = 20), axis.text = element_text(size = 16)), 
+                          seq.logo(grep("0.005", rand.5.ends, value = TRUE)) + 
+                            ylim(0, 0.35) + 
+                            ggtitle("Random sequences") + 
+                            theme(text = element_text(size = 20), axis.text = element_text(size = 16)))
+
+ggsave("blocks_logos_500.png", blocks.logos, width = 24, height = 10, dpi = "retina")
+
+edge.5.logos <- ggarrange(seq.logo(grep("0.005", seqs.5.ends.edge, value = TRUE)) + 
+                            ylim(0, 0.35) + 
+                            ggtitle("5' Edges") + 
+                            theme(text = element_text(size = 20), axis.text = element_text(size = 16)), 
+                          seq.logo(grep("0.005", rand.5.ends.edge, value = TRUE)) + 
+                            ylim(0, 0.35) + 
+                            ggtitle("Random seqeunces") + 
+                            theme(text = element_text(size = 20), axis.text = element_text(size = 16)))
+
+ggsave("5_edge_logos_500.png", edge.5.logos, width = 24, height = 10, dpi = "retina")
+
+edge.3.logos <- ggarrange(seq.logo(grep("0.005", seqs.3.ends.edge, value = TRUE)) + 
+                            ylim(0, 0.35) + 
+                            ggtitle("3' Edges") + 
+                            theme(text = element_text(size = 20), axis.text = element_text(size = 16)), 
+                          seq.logo(grep("0.005", rand.3.ends.edge, value = TRUE)) + 
+                            ylim(0, 0.35) + 
+                            ggtitle("Random seqeunces") + 
+                            theme(text = element_text(size = 20), axis.text = element_text(size = 16)))
+
+ggsave("3_edge_logos_500.png", edge.3.logos, width = 24, height = 10, dpi = "retina")
+```

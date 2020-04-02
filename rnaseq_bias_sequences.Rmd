@@ -1,0 +1,1156 @@
+---
+title: "RNA-Seq Bias Sequences"
+author: "Sadhana Chidambaran"
+output: html_document
+---
+
+```{r echo = FALSE}
+knitr::opts_chunk$set(fig.align = "center", warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r, message = FALSE}
+library(Biostrings)
+library(feather)
+library(ggpubr)
+library(reshape2)
+library(rhdf5)
+library(rtracklayer)
+library(tidyverse)
+```
+
+### Get yeast genomic sequences and H5 data
+
+Get yeast GFF and FASTA files
+```{r}
+# Get yeast GFF
+yeast.gff <- readGFFAsGRanges("/data/riboseq/Supp/seqs/yeast/saccharomyces_cerevisiae.gff")
+
+# Get yeast FASTA and rename it to match the GFF
+yeast.fasta <- readDNAStringSet("/data/riboseq/Supp/seqs/yeast/yeast.fasta")
+names(yeast.fasta) <- unique(seqnames(yeast.gff))
+
+# Get coding sequence annotations
+yeast.gff.cds <- yeast.gff[yeast.gff$type == "CDS"]
+
+# Get coding sequences and rename them
+yeast.fasta.cds <- yeast.fasta[yeast.gff.cds]
+names(yeast.fasta.cds) <- yeast.gff.cds$Name
+
+# Reverse complement coding sequences on the negative strand
+yeast.fasta.cds[strand(yeast.gff.cds) == "-"] <- reverseComplement(yeast.fasta.cds[strand(yeast.gff.cds) == "-"])
+
+# Create final FASTA with just coding sequences and rename them
+yeast.fasta.cds <- DNAStringSet(lapply(unique(yeast.gff.cds$Name), function(x) {
+  unlist(yeast.fasta.cds[names(yeast.fasta.cds) == x])
+}))
+names(yeast.fasta.cds) <- unique(str_remove(yeast.gff.cds$Name, "_CDS"))
+
+# Edit names of GFF
+yeast.gff.cds$Name <- str_remove(yeast.gff.cds$Name, "_CDS")
+```
+
+Get H5 files from riboseq directory (mRNA, wildtype)
+```{r, message = FALSE}
+# Get all subdirectories in riboseq
+riboseq.all.dir <- read_delim("/data/riboseq/dir_list", "\t", col_names = FALSE)
+
+# Get just wildtype mRNA directories
+riboseq.wt.mrna.dir <- grep("mrna", grep("wt", riboseq.all.dir$X1, ignore.case = TRUE, value = TRUE), ignore.case = TRUE, value = TRUE)
+
+# Get h5 file from each subdirectory
+riboseq.h5 <- sapply(riboseq.wt.mrna.dir, function(x) paste("/data/riboseq", x, list.files(paste("/data/riboseq/", x, sep = ""), pattern = ".h5")[1], sep = "/"))
+names(riboseq.h5) <- NULL
+
+# Get h5 group names
+riboseq.groups <- paste(gsub("/", "_", riboseq.wt.mrna.dir), "reads", sep = "/")
+
+# Create dataframe with all file paths
+riboseq.files <- melt(data.frame(riboseq.h5, riboseq.groups)) %>% 
+  dplyr::rename(file = 1, group = 2)
+riboseq.files$file <- as.character(riboseq.files$file)
+riboseq.files$group <- as.character(riboseq.files$group)
+
+# Clean up environment
+rm(riboseq.all.dir, riboseq.h5, riboseq.groups)
+```
+
+Get list of yeast genes by expression level (high to low)
+```{r, message = FALSE}
+# Get data
+yeast.data <- read_tsv("/data/riboseq/processed/yeast/F8_RPKMs.tsv")
+
+# Organize data by expression (high to low)
+all.yeast.genes <- yeast.data %>%
+  filter(Dataset == "rRNA_depleted_using_RiboZero") %>%
+  select(-Year, -Author, -Dataset) %>%
+  melt() %>%
+  group_by(variable) %>%
+  summarise(meanz = mean(value)) %>%
+  ungroup() %>%
+  arrange(desc(meanz))
+
+# Get list of yeast genes
+yeast.genes <- as.character(pull(all.yeast.genes, variable))
+
+# Clean up environment
+rm(yeast.data, all.yeast.genes)
+```
+
+Get widths of all coding sequences
+```{r}
+yeast.genes.width <- sapply(yeast.genes, function(x) {
+  width(yeast.fasta.cds[x])
+}) %>% 
+  as.data.frame() %>% 
+  rownames_to_column() %>% 
+  dplyr::rename("gene" = "rowname", "gene.width" = ".")
+```
+
+### Get the positions of the 5' and 3' ends of all the reads in the 500 most expressed yeast genes
+
+Get the 5' and 3' ends of all the reads in the 500 most expressed yeast genes
+```{r, eval = FALSE}
+# Use data from all riboseq files
+read.data.500 <- lapply(1:nrow(riboseq.files), function(x) {
+  
+  # Get read positions for the 200 most expressed yeast genes
+  gene.data <- mclapply(yeast.genes[1:500], function(y) {
+    
+    # Read data from H5 files
+    h5.data <- h5read(riboseq.files[x, 1], paste("", y, riboseq.files[x, 2], sep = "/"))
+    
+    # Reorganize data
+    h5.data <- t(h5.data[[1]]) %>% 
+      as_tibble() %>% 
+      mutate(read.5.end = 1:nrow(.), gene = y)
+    names(h5.data) <- c(seq(15, 50), "read.5.end", "gene")
+    
+    # Calculate positions of 3' ends
+    h5.data %>% 
+      gather(read.lengths, num.reads, 1:36) %>% 
+      mutate(read.lengths = as.numeric(read.lengths), dataset = riboseq.wt.mrna.dir[x], read.3.end = read.5.end + read.lengths) %>% 
+      select(dataset, gene, read.lengths, num.reads, read.5.end, read.3.end) %>% 
+      arrange(read.5.end)
+    }, mc.cores = 40)
+  
+  gene.data %>% 
+    bind_rows()
+}) %>% 
+  bind_rows()
+```
+
+Write position data to feather files
+```{r, eval = FALSE}
+read.data.500 %>% 
+  split(.$dataset) %>% 
+  map(function(x) {
+    name <- as.character(x$dataset[1]) %>% 
+      str_replace_all("\\/", "_")
+    
+    fullpath <- paste0("/data/sadhana/rnaseq_bias/", name, ".feather")
+    
+    write_feather(x, fullpath)
+  })
+```
+
+### Read in all the data for the 100, 200, and 500 most expressed genes
+
+Read in position data from feather files
+```{r}
+read.data.500 <- lapply(dir("/data/sadhana/rnaseq_bias/feather_files", full.names = TRUE), read_feather) %>% 
+  bind_rows()
+
+read.data.200 <- read.data.500 %>% 
+  filter(gene %in% yeast.genes[1:200])
+
+read.data.100 <- read.data.500 %>% 
+  filter(gene %in% yeast.genes[1:100])
+```
+
+Create vector of thresholds
+```{r}
+thresholds <- c(0.005, 0.01, 0.02, 0.05, 0.1)
+names(thresholds) <- thresholds
+```
+
+### Normalize read end counts (both 5' and 3') for the 100, 200, and 500 most expressed genes
+
+Create functions to normalize read counts for 5' and 3' read ends
+```{r}
+normalize.reads.5.ends <- function(data) {
+  data %>% 
+    filter(read.5.end > 250) %>% 
+    mutate(read.5.end = read.5.end - 250) %>% 
+    select(-read.3.end) %>% 
+    left_join(yeast.genes.width, by = "gene") %>% 
+    filter(read.5.end <= gene.width) %>% 
+    group_by(gene, gene.width, read.5.end) %>% 
+    summarize(sum.reads = sum(num.reads)) %>% 
+    ungroup() %>% 
+    group_by(gene) %>% 
+    mutate(avg.reads = mean(sum.reads), norm.reads = sum.reads / avg.reads) %>% 
+    ungroup()
+}
+
+normalize.reads.3.ends <- function(data) {
+  data %>% 
+    filter(read.3.end > 250) %>% 
+    mutate(read.3.end = read.3.end - 250) %>% 
+    select(-read.5.end) %>% 
+    left_join(yeast.genes.width, by = "gene") %>% 
+    filter(read.3.end <= gene.width) %>% 
+    group_by(gene, gene.width, read.3.end) %>% 
+    summarize(sum.reads = sum(num.reads)) %>% 
+    ungroup() %>% 
+    group_by(gene) %>% 
+    mutate(avg.reads = mean(sum.reads), norm.reads = sum.reads / avg.reads) %>% 
+    ungroup()
+}
+```
+
+Normalize all data
+```{r}
+norm.data.500.5.ends <- normalize.reads.5.ends(read.data.500)
+norm.data.500.3.ends <- normalize.reads.3.ends(read.data.500)
+
+norm.data.200.5.ends <- normalize.reads.5.ends(read.data.200)
+norm.data.200.3.ends <- normalize.reads.3.ends(read.data.200)
+
+norm.data.100.5.ends <- normalize.reads.5.ends(read.data.100)
+norm.data.100.3.ends <- normalize.reads.3.ends(read.data.100)
+```
+
+### Create functions to identify regions with few read ends, get sequences at these regions, and to get random sequences
+
+Functions to get data just from areas where few 5' read ends or 3' read ends align
+```{r}
+# Function to identify regions where few 5' read ends align
+data.5.ends <- function(norm.data, threshold) {
+  
+  # Group positions into blocks
+  blocks.data <- norm.data %>% 
+    select(gene, gene.width, read.5.end, norm.reads) %>% 
+    filter(norm.reads < threshold) %>% 
+    arrange(gene, read.5.end) %>% 
+    mutate(prev.5.end = lag(read.5.end), prev.gene = lag(gene), diff.5.end = ((read.5.end - prev.5.end <= 5) & (gene == prev.gene)))
+  
+  blocks.data$diff.5.end[is.na(blocks.data$diff.5.end)] <- FALSE
+  blocks.data$groups <- 0
+  group.num <- 0
+  
+  for (i in seq(nrow(blocks.data))) {
+    if (!blocks.data$diff.5.end[i]) {
+      group.num <- group.num + 1
+      blocks.data$groups[i] <- group.num
+    } else {
+      blocks.data$groups[i] <- group.num
+    }
+  }
+  
+  # Filter for blocks between 5 and 30 bp
+  blocks.data <- blocks.data %>% 
+    group_by(groups) %>% 
+    filter(n() >= 5 & n() <= 30) %>% 
+    mutate(center = ifelse(row_number() == ceiling(n() / 2), TRUE, FALSE)) %>% 
+    ungroup()
+  
+  # Identify the center of each block
+  blocks.center <- blocks.data %>% 
+    filter(center) %>% 
+    mutate(start = ifelse(read.5.end < 16, 1, ifelse(read.5.end + 14 > gene.width, gene.width - 29, read.5.end - 15)), 
+           end = ifelse(read.5.end < 16, 30, ifelse(read.5.end + 14 > gene.width, gene.width, read.5.end + 14)))
+  
+  blocks.data <- blocks.data %>% 
+    left_join(blocks.center %>% 
+                select(groups, start, end), by = "groups")
+  
+  blocks.data
+}
+
+# Function to identify regions where few 3' read ends align
+data.3.ends <- function(norm.data, threshold) {
+  
+  # Group positions into blocks
+  blocks.data <- norm.data %>% 
+    select(gene, gene.width, read.3.end, norm.reads) %>% 
+    filter(norm.reads < threshold) %>% 
+    arrange(gene, read.3.end) %>% 
+    mutate(prev.3.end = lag(read.3.end), prev.gene = lag(gene), diff.3.end = ((read.3.end - prev.3.end <= 5) & (gene == prev.gene)))
+  
+  blocks.data$diff.3.end[is.na(blocks.data$diff.3.end)] <- FALSE
+  blocks.data$groups <- 0
+  group.num <- 0
+  
+  for (i in seq(nrow(blocks.data))) {
+    if (!blocks.data$diff.3.end[i]) {
+      group.num <- group.num + 1
+      blocks.data$groups[i] <- group.num
+    } else {
+      blocks.data$groups[i] <- group.num
+    }
+  }
+  
+  # Filter for blocks between 5 and 30 bp
+  blocks.data <- blocks.data %>% 
+    group_by(groups) %>% 
+    filter(n() >= 5 & n() <= 30) %>% 
+    mutate(center = ifelse(row_number() == ceiling(n() / 2), TRUE, FALSE)) %>% 
+    ungroup()
+  
+  # Identify the center of each block
+  blocks.center <- blocks.data %>% 
+    filter(center) %>% 
+    mutate(start = ifelse(read.3.end < 16, 1, ifelse(read.3.end + 14 > gene.width, gene.width - 29, read.3.end - 15)), 
+           end = ifelse(read.3.end < 16, 30, ifelse(read.3.end + 14 > gene.width, gene.width, read.3.end + 14)))
+  
+  blocks.data <- blocks.data %>% 
+    left_join(blocks.center %>% 
+                select(groups, start, end), by = "groups")
+  
+  blocks.data
+}
+```
+
+Function to get actual sequences
+```{r}
+get.seqs <- function(data) {
+  data <- data %>% 
+    filter(center)
+  
+  apply(data, 1, function(x) {
+    subseq(yeast.fasta.cds[x["gene"]], as.numeric(x["start"]), as.numeric(x["end"]))
+  }) %>% 
+    do.call(c, .)
+}
+```
+
+Functions to randomly select 30 base pair sequences from areas not overlapping regions where few 5' or 3' read ends align
+```{r}
+# For each region where few 5' read ends align, a 30 base pair sequence is selected from the same gene. This new sequence does not overlap the original sequence, but does start with the same base (A, U, G, or C).
+random.sequences.5.ends <- function(data) {
+  
+  # Create GRanges for blocks
+  granges.blocks <- data %>% 
+    group_by(groups) %>% 
+    distinct(gene, start, end) %>% 
+    ungroup() %>% 
+    dplyr::rename("seqnames" = "gene") %>% 
+    makeGRangesFromDataFrame()
+  
+  # Create GRanges for edges
+  granges.edges <- data %>% 
+    group_by(gene, groups) %>% 
+    summarize(edge = min(read.5.end)) %>% 
+    ungroup() %>% 
+    mutate(start = edge - 15, end = edge + 14) %>% 
+    dplyr::rename("seqnames" = "gene") %>% 
+    makeGRangesFromDataFrame()
+  
+  # Create GRanges for whole genes
+  granges.genes <- yeast.genes.width %>% 
+    filter(gene %in% data$gene) %>% 
+    mutate(start = 1) %>% 
+    dplyr::rename("seqnames" = "gene", "end" = "gene.width") %>% 
+    makeGRangesFromDataFrame()
+  
+  # Get difference between three GRanges (these will be the ranges the random sequences can come from)
+  granges.diff <- setdiff(granges.genes, granges.blocks) %>% 
+    setdiff(granges.edges)
+  
+  rand.seqs <- DNAStringSet()
+  rand.edges <- DNAStringSet()
+
+  # Get random sequences
+  for (i in 1:length(granges.blocks)) {
+
+    # Get range of random sequence (repeat until range does not overlap existing blocks)
+    repeat {
+      rand.data <- granges.diff %>%
+        as.data.frame() %>%
+        filter(seqnames == as.character(seqnames(granges.blocks)[i])) %>%
+        sample_n(1) %>%
+        mutate(rand.pos = sample(start:end, 1), check.rand = (rand.pos + 29 < end))
+
+      # If position is within correct range, get sequence
+      if (rand.data[1, "check.rand"]) {
+
+        rand.sequence <- subseq(yeast.fasta.cds[as.character(rand.data[1, "seqnames"])],
+                      as.numeric(rand.data[1, "rand.pos"]),
+                      as.numeric(rand.data[1, "rand.pos"]) + 29)
+
+        rand.sequence.first <- substr(as.character(rand.sequence), 1, 1)
+
+        orig.sequence <- subseq(yeast.fasta.cds[as.character(seqnames(granges.blocks))[i]],
+                                    as.numeric(start(ranges(granges.blocks)))[i],
+                                    as.numeric(end(ranges(granges.blocks)))[i])
+
+        orig.sequence.first <- substr(as.character(orig.sequence), 1, 1)
+
+        if (rand.sequence.first == orig.sequence.first) {
+          break
+        }
+      }
+    }
+    
+    # Get range of random edge sequence (repeat until range does not overlap existing blocks or edges)
+    repeat {
+      edge.data <- granges.diff %>%
+        as.data.frame() %>%
+        filter(seqnames == as.character(seqnames(granges.blocks)[i])) %>%
+        sample_n(1) %>%
+        mutate(edge.pos = sample(start:end, 1), check.rand = (edge.pos + 29 < end))
+
+      # If position is within correct range, get sequence
+      if (edge.data[1, "check.rand"]) {
+
+        edge.sequence <- subseq(yeast.fasta.cds[as.character(edge.data[1, "seqnames"])], 
+                                as.numeric(edge.data[1, "edge.pos"]), 
+                                as.numeric(edge.data[1, "edge.pos"]) + 29)
+        break
+      }
+    }
+    
+    rand.seqs <- c(rand.seqs, rand.sequence)
+    rand.edges <- c(rand.edges, edge.sequence)
+
+    # Add sequence annotation to GRanges so other sequences can't overlap
+    granges.blocks <- rand.data %>%
+      select(seqnames, rand.pos) %>%
+      dplyr::rename("start" = "rand.pos") %>%
+      mutate(end = start + 29) %>%
+      GRanges() %>%
+      append(granges.blocks, .)
+    
+    granges.edges <- edge.data %>% 
+      select(seqnames, edge.pos) %>% 
+      dplyr::rename("start" = "edge.pos") %>% 
+      mutate(end = start + 29) %>% 
+      GRanges() %>% 
+      append(granges.edges, .)
+
+     granges.diff <- setdiff(granges.genes, granges.blocks) %>% 
+       setdiff(granges.edges)
+  }
+
+  list(rand.seqs, rand.edges)
+}
+
+# For each region where few 3' read ends align, a 30 base pair sequence is selected from the same gene. This new sequence does not overlap the original sequence, but does end with the same base (A, U, G, or C).
+random.sequences.3.ends <- function(data) {
+  
+  # Create GRanges for blocks
+  granges.blocks <- data %>% 
+    group_by(groups) %>% 
+    distinct(gene, start, end) %>% 
+    ungroup() %>% 
+    dplyr::rename("seqnames" = "gene") %>% 
+    makeGRangesFromDataFrame()
+  
+  # Create GRanges for edges
+  granges.edges <- data %>% 
+    group_by(gene, groups) %>% 
+    summarize(edge = max(read.3.end)) %>% 
+    ungroup() %>% 
+    mutate(start = edge - 15, end = edge + 14) %>% 
+    dplyr::rename("seqnames" = "gene") %>% 
+    makeGRangesFromDataFrame()
+  
+  # Create GRanges for whole genes
+  granges.genes <- yeast.genes.width %>% 
+    filter(gene %in% data$gene) %>% 
+    mutate(start = 1) %>% 
+    dplyr::rename("seqnames" = "gene", "end" = "gene.width") %>% 
+    makeGRangesFromDataFrame()
+  
+  # Get difference between three GRanges (these will be the ranges the random sequences can come from)
+  granges.diff <- setdiff(granges.genes, granges.blocks) %>% 
+    setdiff(granges.edges)
+  
+  rand.seqs <- DNAStringSet()
+  rand.edges <- DNAStringSet()
+  
+  rand.seqs <- DNAStringSet()
+
+  # Get random sequences
+  for (i in 1:length(granges.blocks)) {
+    
+    # Get range of random sequence (repeat until range does not overlap existing blocks)
+    repeat {
+      rand.data <- granges.diff %>% 
+        as.data.frame() %>% 
+        filter(seqnames == as.character(seqnames(granges.blocks)[i])) %>% 
+        sample_n(1) %>% 
+        mutate(rand.pos = sample(start:end, 1), check.rand = (rand.pos + 29 < end))
+      
+      # If position is within correct range, get sequence
+      if (rand.data[1, "check.rand"]) {
+        
+        rand.sequence <- as.character(subseq(yeast.fasta.cds[as.character(rand.data[1, "seqnames"])], 
+                      as.numeric(rand.data[1, "rand.pos"]), 
+                      as.numeric(rand.data[1, "rand.pos"]) + 29))
+        
+        rand.sequence.last <- substr(rand.sequence, nchar(rand.sequence), nchar(rand.sequence))
+        
+        orig.sequence <- as.character(subseq(yeast.fasta.cds[as.character(seqnames(granges.blocks))[i]], 
+                                    as.numeric(start(ranges(granges.blocks)))[i], 
+                                    as.numeric(end(ranges(granges.blocks)))[i]))
+        
+        orig.sequence.last <- substr(orig.sequence, nchar(orig.sequence), nchar(orig.sequence))
+        
+        if (rand.sequence.last == orig.sequence.last) {
+          break
+        }
+      }
+    }
+    
+    # Get range of random edge sequence (repeat until range does not overlap existing blocks or edges)
+    repeat {
+      edge.data <- granges.diff %>%
+        as.data.frame() %>%
+        filter(seqnames == as.character(seqnames(granges.blocks)[i])) %>%
+        sample_n(1) %>%
+        mutate(edge.pos = sample(start:end, 1), check.rand = (edge.pos + 29 < end))
+
+      # If position is within correct range, get sequence
+      if (edge.data[1, "check.rand"]) {
+
+        edge.sequence <- subseq(yeast.fasta.cds[as.character(edge.data[1, "seqnames"])], 
+                                as.numeric(edge.data[1, "edge.pos"]), 
+                                as.numeric(edge.data[1, "edge.pos"]) + 29)
+        break
+      }
+    }
+    
+    rand.seqs <- c(rand.seqs, rand.sequence)
+    rand.edges <- c(rand.edges, edge.sequence)
+
+    # Add sequence annotation to GRanges so other sequences can't overlap
+    granges.blocks <- rand.data %>%
+      select(seqnames, rand.pos) %>%
+      dplyr::rename("start" = "rand.pos") %>%
+      mutate(end = start + 29) %>%
+      GRanges() %>%
+      append(granges.blocks, .)
+    
+    granges.edges <- edge.data %>% 
+      select(seqnames, edge.pos) %>% 
+      dplyr::rename("start" = "edge.pos") %>% 
+      mutate(end = start + 29) %>% 
+      GRanges() %>% 
+      append(granges.edges, .)
+
+     granges.diff <- setdiff(granges.genes, granges.blocks) %>% 
+       setdiff(granges.edges)
+  }
+
+  list(rand.seqs, rand.edges)
+}
+```
+
+Get sequences at 5' edge of areas where few read ends align
+```{r}
+# Get sequence 5 bases upstream and downstream of 5' end of given region
+get.5.edge.seqs <- function(data) {
+  
+  edge.data <- data %>% 
+    group_by(gene, gene.width, groups) %>% 
+    summarize(edge = min(read.5.end)) %>% 
+    ungroup() %>% 
+    mutate(edge.start = edge - 15, edge.end = edge + 14)
+  
+  apply(edge.data, 1, function(row) {
+    
+    # If both the starting and ending positions of the edge sequence are within the CDS, subset the sequence
+    if (as.numeric(row["edge.start"]) > 0 & as.numeric(row["edge.end"]) > 0) {
+
+      subseq(yeast.fasta.cds[as.character(row["gene"])],
+             as.numeric(row["edge.start"]),
+             as.numeric(row["edge.end"]))
+  
+      # Otherwise, need to go into GFF to get annotations to subset the chromosome sequence
+    } else {
+
+      seq.annot <- yeast.gff.cds[yeast.gff.cds$Name == as.character(row["gene"])] %>% 
+        as.data.frame()
+      
+      # If gene is on the negative strand
+      if (unique(seq.annot$strand) == "-") {
+
+        # Get positions of CDS within the chromosome
+        pos.vec <- c()
+        for (i in seq(nrow(seq.annot))) {
+          pos.vec <- c(pos.vec, seq(seq.annot$start[i], seq.annot$end[i]))
+        }
+        names(pos.vec) <- rev(seq(1:length(pos.vec)))
+        
+        # Index into position vector to get edge sequence
+        indexes <- c()
+        for (j in rev(seq(as.numeric(row["edge.start"]), as.numeric(row["edge.end"])))) {
+          if (j < 1) {
+            indexes <- c(indexes, pos.vec["1"] + 1 - j)
+          } else {
+            indexes <- c(indexes, pos.vec[as.character(j)])
+          }
+        }
+        names(indexes) <- NULL
+        
+        # Get actual edge sequence
+        seqs <- c()
+        for (k in indexes) {
+          base <- subseq(yeast.fasta[as.character(unique(seq.annot$seqnames))], as.numeric(k), as.numeric(k))
+          seqs <- c(seqs, as.character(base))
+        }
+
+        # Reverse complememnt edge sequence
+        final.seq <- paste(seqs, collapse = "") %>%
+          DNAStringSet() %>%
+          reverseComplement()
+        names(final.seq) <- as.character(row["gene"])
+        final.seq
+        
+        # If gene is on the positive strand
+      } else {
+        
+        # Get positions of CDS within the chromosome
+        pos.vec <- c()
+        for (i in seq(nrow(seq.annot))) {
+          pos.vec <- c(pos.vec, seq(seq.annot$start[i], seq.annot$end[i]))
+        }
+        names(pos.vec) <- seq(1:length(pos.vec))
+        
+        # Index into position vector to get edge sequence
+        indexes <- c()
+        for (j in seq(as.numeric(row["edge.start"]), as.numeric(row["edge.end"]))) {
+          if (j < 1) {
+            indexes <- c(indexes, pos.vec["1"] - 1 + j)
+          } else {
+            indexes <- c(indexes, pos.vec[as.character(j)])
+          }
+        }
+        names(indexes) <- NULL
+        
+        # Get actual edge sequence
+        seqs <- c()
+        for (k in indexes) {
+          base <- subseq(yeast.fasta[as.character(unique(seq.annot$seqnames))], as.numeric(k), as.numeric(k))
+          seqs <- c(seqs, as.character(base))
+        }
+
+        final.seq <- paste(seqs, collapse = "") %>%
+          DNAStringSet()
+        names(final.seq) <- as.character(row["gene"])
+        final.seq
+      }
+    }
+  }) %>% 
+    do.call(c, .)
+}
+```
+
+Get sequences at 3' edge of areas where few read ends align
+```{r}
+# Get sequence 5 bases upstream and downstream of 3' end of given region
+get.3.edge.seqs <- function(data) {
+  
+  edge.data <- data %>% 
+    group_by(gene, gene.width, groups) %>% 
+    summarize(edge = max(read.3.end)) %>% 
+    mutate(edge.start = edge - 15, edge.end = edge + 14)
+
+  apply(edge.data, 1, function(row) {
+
+    if (as.numeric(row["edge.start"]) > 0 & as.numeric(row["edge.end"]) > 0) {
+
+      # Check if end of edge goes past the CDS
+      if (as.numeric(row["edge.end"]) > as.numeric(row["gene.width"])) {
+        
+        seq.annot <- yeast.gff.cds[yeast.gff.cds$Name == as.character(row["gene"])] %>%
+          as.data.frame()
+        
+        # If gene is on the negative strand
+        if (unique(seq.annot$strand) == "-") {
+          
+          pos.vec <- c()
+          for (i in seq(nrow(seq.annot))) {
+            pos.vec <- c(pos.vec, seq(seq.annot$start[i], seq.annot$end[i]))
+          }
+          names(pos.vec) <- rev(seq(1:length(pos.vec)))
+
+          indexes <- c()
+          for (j in rev(seq(as.numeric(row["edge.start"]), as.numeric(row["edge.end"])))) {
+            if (j > as.numeric(row["gene.width"])) {
+              indexes <- c(indexes, pos.vec[as.numeric(row["gene.width"])] + (j - as.numeric(row["gene.width"])))
+            } else {
+              indexes <- c(indexes, pos.vec[as.character(j)])
+            }
+          }
+          names(indexes) <- NULL
+
+          seqs <- c()
+          for (k in indexes) {
+            base <- subseq(yeast.fasta[as.character(unique(seq.annot$seqnames))], as.numeric(k), as.numeric(k))
+            seqs <- c(seqs, as.character(base))
+          }
+
+          final.seq <- paste(seqs, collapse = "") %>%
+            DNAStringSet() %>%
+            reverseComplement()
+          names(final.seq) <- as.character(row["gene"])
+          final.seq
+          
+          # If gene is on the positive strand
+        } else {
+          
+          pos.vec <- c()
+          for (i in seq(nrow(seq.annot))) {
+            pos.vec <- c(pos.vec, seq(seq.annot$start[i], seq.annot$end[i]))
+          }
+          names(pos.vec) <- seq(1:length(pos.vec))
+
+          indexes <- c()
+          for (j in seq(as.numeric(row["edge.start"]), as.numeric(row["edge.end"]))) {
+            if (j > as.numeric(row["gene.width"])) {
+              indexes <- c(indexes, pos.vec[as.numeric(row["gene.width"])] - (j - as.numeric(row["gene.width"])))
+            } else {
+              indexes <- c(indexes, pos.vec[as.character(j)])
+            }
+          }
+          names(indexes) <- NULL
+          
+          seqs <- c()
+          for (k in indexes) {
+            base <- subseq(yeast.fasta[as.character(unique(seq.annot$seqnames))], as.numeric(k), as.numeric(k))
+            seqs <- c(seqs, as.character(base))
+          }
+          
+          final.seq <- paste(seqs, collapse = "") %>%
+            DNAStringSet()
+          names(final.seq) <- as.character(row["gene"])
+          final.seq
+        }
+      } else {
+        
+        # If both the starting and ending positions of the edge sequence are within the CDS, subset the sequence
+        subseq(yeast.fasta.cds[as.character(row["gene"])],
+               as.numeric(row["edge.start"]),
+               as.numeric(row["edge.end"]))
+      }
+
+      # Otherwise, need to go into CDS to get annotations to subset the chromosome sequence
+    } else {
+      
+      seq.annot <- yeast.gff.cds[yeast.gff.cds$Name == as.character(row["gene"])] %>% 
+        as.data.frame()
+      
+      # If gene is on the negative strand
+      if (unique(seq.annot$strand) == "-") {
+
+        # Get positions of CDS within the chromosome
+        pos.vec <- c()
+        for (i in seq(nrow(seq.annot))) {
+          pos.vec <- c(pos.vec, seq(seq.annot$start[i], seq.annot$end[i]))
+        }
+        names(pos.vec) <- rev(seq(1:length(pos.vec)))
+        
+        # Index into position vector to get edge sequence
+        indexes <- c()
+        for (j in rev(seq(as.numeric(row["edge.start"]), as.numeric(row["edge.end"])))) {
+          if (j < 1) {
+            indexes <- c(indexes, pos.vec["1"] + 1 - j)
+          } else {
+            indexes <- c(indexes, pos.vec[as.character(j)])
+          }
+        }
+        names(indexes) <- NULL
+        
+        # Get actual edge sequence
+        seqs <- c()
+        for (k in indexes) {
+          base <- subseq(yeast.fasta[as.character(unique(seq.annot$seqnames))], as.numeric(k), as.numeric(k))
+          seqs <- c(seqs, as.character(base))
+        }
+
+        # Reverse complememnt edge sequence
+        final.seq <- paste(seqs, collapse = "") %>%
+          DNAStringSet() %>%
+          reverseComplement()
+        names(final.seq) <- as.character(row["gene"])
+        final.seq
+        
+        # If gene is on the positive strand
+      } else {
+        
+        # Get positions of CDS within the chromosome
+        pos.vec <- c()
+        for (i in seq(nrow(seq.annot))) {
+          pos.vec <- c(pos.vec, seq(seq.annot$start[i], seq.annot$end[i]))
+        }
+        names(pos.vec) <- seq(1:length(pos.vec))
+        
+        # Index into position vector to get edge sequence
+        indexes <- c()
+        for (j in seq(as.numeric(row["edge.start"]), as.numeric(row["edge.end"]))) {
+          if (j < 1) {
+            indexes <- c(indexes, pos.vec["1"] - 1 + j)
+          } else {
+            indexes <- c(indexes, pos.vec[as.character(j)])
+          }
+        }
+        names(indexes) <- NULL
+        
+        # Get actual edge sequence
+        seqs <- c()
+        for (k in indexes) {
+          base <- subseq(yeast.fasta[as.character(unique(seq.annot$seqnames))], as.numeric(k), as.numeric(k))
+          seqs <- c(seqs, as.character(base))
+        }
+
+        final.seq <- paste(seqs, collapse = "") %>%
+          DNAStringSet()
+        names(final.seq) <- as.character(row["gene"])
+        final.seq
+      }
+    }
+  }) %>% 
+    do.call(c, .)
+}
+```
+
+Function to write sequences to FASTA files
+```{r}
+write.fasta <- function(data, path, threshold) {
+  writeXStringSet(data, paste0(path, threshold, ".fasta"))
+}
+```
+
+### Get data and sequences for the 100 most expressed genes
+
+Get read end data for the 100 most expressed genes
+```{r}
+data.100.5.ends <- lapply(thresholds, function(x) { data.5.ends(norm.data.100.5.ends, x) })
+data.100.3.ends <- lapply(thresholds, function(x) { data.3.ends(norm.data.100.3.ends, x) })
+```
+
+Get sequences corresponding to areas with few 5' or 3' read ends
+```{r}
+seqs.100.5.ends <- lapply(data.100.5.ends, get.seqs)
+seqs.100.3.ends <- lapply(data.100.3.ends, get.seqs)
+```
+
+Write sequences for 100 most expressed genes to FASTA files
+```{r}
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.100.5.ends[[x]], "/data/sadhana/rnaseq_bias/fastas/100_genes/seqs_5_ends_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.100.3.ends[[x]], "/data/sadhana/rnaseq_bias/fastas/100_genes/seqs_3_ends_", x)
+}) %>% 
+  invisible()
+```
+
+Get sequences at edges of areas with few 5' or 3' read ends
+```{r}
+seqs.100.5.ends.edge <- lapply(data.100.5.ends, get.5.edge.seqs)
+seqs.100.3.ends.edge <- lapply(data.100.3.ends, get.3.edge.seqs)
+```
+
+Write edge sequences for 100 most expressed genes to FASTA files
+```{r}
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.100.5.ends.edge[[x]], "/data/sadhana/rnaseq_bias/fastas/100_genes/seqs_5_ends_edge_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.100.3.ends.edge[[x]], "/data/sadhana/rnaseq_bias/fastas/100_genes/seqs_3_ends_edge_", x)
+}) %>% 
+  invisible()
+```
+
+Get random sequences corresponding to areas where few 5' or 3' read ends align, for the 100 most expressed genes
+This will also get random 11 bp sequences to compare with the edge sequences
+```{r}
+rand.seqs.100.5.ends <- lapply(data.100.5.ends, random.sequences.5.ends)
+rand.seqs.100.3.ends <- lapply(data.100.3.ends, random.sequences.3.ends)
+```
+
+Write random sequences for 100 most expressed genes to FASTA files
+```{r}
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.100.5.ends[[x]][[1]], "/data/sadhana/rnaseq_bias/fastas/100_genes/rand_5_ends_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.100.5.ends[[x]][[2]], "/data/sadhana/rnaseq_bias/fastas/100_genes/rand_5_ends_edge_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.100.3.ends[[x]][[1]], "/data/sadhana/rnaseq_bias/fastas/100_genes/rand_3_ends_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.100.3.ends[[x]][[2]], "/data/sadhana/rnaseq_bias/fastas/100_genes/rand_3_ends_edge_", x)
+}) %>% 
+  invisible()
+```
+
+### Get data and sequences for the 200 most expressed genes
+
+Get read end data for the 200 most expressed genes
+```{r}
+data.200.5.ends <- lapply(thresholds, function(x) { data.5.ends(norm.data.200.5.ends, x) })
+data.200.3.ends <- lapply(thresholds, function(x) { data.3.ends(norm.data.200.3.ends, x) })
+```
+
+Get sequences corresponding to areas with few 5' or 3' read ends
+```{r}
+seqs.200.5.ends <- lapply(data.200.5.ends, get.seqs)
+seqs.200.3.ends <- lapply(data.200.3.ends, get.seqs)
+```
+
+Write sequences for 200 most expressed genes to FASTA files
+```{r}
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.200.5.ends[[x]], "/data/sadhana/rnaseq_bias/fastas/200_genes/seqs_5_ends_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.200.3.ends[[x]], "/data/sadhana/rnaseq_bias/fastas/200_genes/seqs_3_ends_", x)
+}) %>% 
+  invisible()
+```
+
+Get sequences at edges of areas with few 5' or 3' read ends
+```{r}
+seqs.200.5.ends.edge <- lapply(data.200.5.ends, get.5.edge.seqs)
+seqs.200.3.ends.edge <- lapply(data.200.3.ends, get.3.edge.seqs)
+
+
+
+data.100.5.ends$`0.005` # CCCAATTGGTTTCGGTATCAAGAAGTTGCA
+subseq(yeast.fasta.cds["YAL003W"], 61 - 15, 61 + 14)
+```
+
+Write edge sequences for 200 most expressed genes to FASTA files
+```{r}
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.200.5.ends.edge[[x]], "/data/sadhana/rnaseq_bias/fastas/200_genes/seqs_5_ends_edge_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.200.3.ends.edge[[x]], "/data/sadhana/rnaseq_bias/fastas/200_genes/seqs_3_ends_edge_", x)
+}) %>% 
+  invisible()
+```
+
+Get random sequences corresponding to areas where few 5' or 3' read ends align, for the 200 most expressed genes
+This will also get random 11 bp sequences to compare with the edge sequences
+```{r}
+rand.seqs.200.5.ends <- lapply(data.200.5.ends, random.sequences.5.ends)
+rand.seqs.200.3.ends <- lapply(data.200.3.ends, random.sequences.3.ends)
+```
+
+Write random sequences for 200 most expressed genes to FASTA files
+```{r}
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.200.5.ends[[x]][[1]], "/data/sadhana/rnaseq_bias/fastas/200_genes/rand_5_ends_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.200.5.ends[[x]][[2]], "/data/sadhana/rnaseq_bias/fastas/200_genes/rand_5_ends_edge_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.200.3.ends[[x]][[1]], "/data/sadhana/rnaseq_bias/fastas/200_genes/rand_3_ends_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.200.3.ends[[x]][[2]], "/data/sadhana/rnaseq_bias/fastas/200_genes/rand_3_ends_edge_", x)
+}) %>% 
+  invisible()
+```
+
+### Get data and sequences for the 500 most expressed genes
+
+Get read end data for the 500 most expressed genes
+```{r}
+data.500.5.ends <- lapply(thresholds, function(x) { data.5.ends(norm.data.500.5.ends, x) })
+data.500.3.ends <- lapply(thresholds, function(x) { data.3.ends(norm.data.500.3.ends, x) })
+```
+
+Get sequences corresponding to areas with few 5' or 3' read ends
+```{r}
+seqs.500.5.ends <- lapply(data.500.5.ends, get.seqs)
+seqs.500.3.ends <- lapply(data.500.3.ends, get.seqs)
+```
+
+Write sequences for 500 most expressed genes to FASTA files
+```{r}
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.500.5.ends[[x]], "/data/sadhana/rnaseq_bias/fastas/500_genes/seqs_5_ends_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.500.3.ends[[x]], "/data/sadhana/rnaseq_bias/fastas/500_genes/seqs_3_ends_", x)
+}) %>% 
+  invisible()
+```
+
+Get sequences at edges of areas with few 5' or 3' read ends
+```{r}
+seqs.500.5.ends.edge <- lapply(data.500.5.ends, get.5.edge.seqs)
+seqs.500.3.ends.edge <- lapply(data.500.3.ends, get.3.edge.seqs)
+```
+
+Write edge sequences for 500 most expressed genes to FASTA files
+```{r}
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.500.5.ends.edge[[x]], "/data/sadhana/rnaseq_bias/fastas/500_genes/seqs_5_ends_edge_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(seqs.500.3.ends.edge[[x]], "/data/sadhana/rnaseq_bias/fastas/500_genes/seqs_3_ends_edge_", x)
+}) %>% 
+  invisible()
+```
+
+Get random sequences corresponding to areas where few 5' or 3' read ends align, for the 500 most expressed genes
+This will also get random 11 bp sequences to compare with the edge sequences
+```{r}
+rand.seqs.500.5.ends <- lapply(data.500.5.ends, random.sequences.5.ends)
+rand.seqs.500.3.ends <- lapply(data.500.3.ends, random.sequences.3.ends)
+```
+
+Write random sequences for 500 most expressed genes to FASTA files
+```{r}
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.500.5.ends[[x]][[1]], "/data/sadhana/rnaseq_bias/fastas/500_genes/rand_5_ends_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.500.5.ends[[x]][[2]], "/data/sadhana/rnaseq_bias/fastas/500_genes/rand_5_ends_edge_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.500.3.ends[[x]][[1]], "/data/sadhana/rnaseq_bias/fastas/500_genes/rand_3_ends_", x)
+}) %>% 
+  invisible()
+
+lapply(names(thresholds), function(x) {
+  write.fasta(rand.seqs.500.3.ends[[x]][[2]], "/data/sadhana/rnaseq_bias/fastas/500_genes/rand_3_ends_edge_", x)
+}) %>% 
+  invisible()
+```
+
+### Comparison graphs of read end counts for one gene between multiple datasets
+
+```{r}
+riboseq.files.subset <- c("2013/Zinshteyn/WT_mRNA_1", "2014/Pop/WT_mrna", "2015/Nedialkova/WT_mRNA_YPD_rep1")
+
+YOL086C.data <- read.data.100 %>% 
+  filter(gene == "YOL086C" & dataset %in% riboseq.files.subset)
+
+dataset.labels <- c("Zinshteyn and Gilbert, 2013", "Pop et al., 2014", "Nedialkova and Leidel, 2015")
+names(dataset.labels) <- riboseq.files.subset
+
+YOL086C.5.plot <- YOL086C.data %>% 
+  filter(read.5.end > 250) %>% 
+  mutate(read.5.end = read.5.end - 250) %>% 
+  filter(read.5.end < width(yeast.fasta.cds["YOL086C"])) %>% 
+  ggplot(., aes(x = read.5.end, y = num.reads)) + 
+  geom_col(width = 1) + 
+  scale_x_continuous(breaks = c(200, 400, 600, 800, 1000)) + 
+  facet_wrap(~dataset, labeller = labeller(dataset = dataset.labels), scales = "free_y", dir = "v") + 
+  labs(x = "Position", y = "5' Read End Counts") + 
+  theme(text = element_text(size = 14), axis.text = element_text(size = 14))
+
+YOL086C.3.plot <- YOL086C.data %>% 
+  filter(read.5.end > 250) %>% 
+  mutate(read.3.end = read.3.end - 250) %>% 
+  filter(read.3.end < width(yeast.fasta.cds["YOL086C"])) %>% 
+  ggplot(., aes(x = read.3.end, y = num.reads)) + 
+  geom_col(width = 1) + 
+  scale_x_continuous(breaks = c(200, 400, 600, 800, 1000)) + 
+  facet_wrap(~dataset, labeller = labeller(dataset = dataset.labels), scales = "free_y", dir = "v") + 
+  labs(x = "Position", y = "3' Read End Counts") + 
+  theme(text = element_text(size = 14), axis.text = element_text(size = 14))
+
+ggarrange(YOL086C.5.plot, YOL086C.3.plot)
+
+## ggsave("fragmentation_pattern.png", width = 9, height = 5, dpi = "retina")
+```
+
+### Summarize sequence data
+
+```{r, eval = FALSE}
+num.blocks.5.ends <- bind_rows(data.100.5.ends %>% 
+            bind_rows(.id = "threshold"), 
+          data.200.5.ends %>% 
+            bind_rows(.id = "threshold"), 
+          data.500.5.ends %>% 
+            bind_rows(.id = "threshold") ,
+          .id = "num.genes") %>% 
+  filter(threshold %in% c(0.005, 0.05, 0.1)) %>% 
+  mutate(num.genes = recode(num.genes, `1` = "100 Genes", `2` = "200 Genes", `3` = "500 Genes")) %>% 
+  select(num.genes, threshold, groups) %>% 
+  distinct() %>% 
+  group_by(num.genes, threshold) %>% 
+  summarize(num.groups = n())
+
+plot.num.blocks.5.ends <- ggplot(num.blocks.5.ends, aes(x = threshold, y = num.groups)) + 
+  geom_col() + 
+  facet_wrap(~num.genes) + 
+  labs(title = "5' Read Ends", 
+       x = "Threshold", y = "Number of Blocks") + 
+  theme(text = element_text(size = 16), axis.text = element_text(size = 16))
+
+## ggsave("num_blocks_5_ends.png", plot.num.blocks.5.ends, width = 9, height = 5, dpi = "retina")
+```
+
+```{r}
+num.blocks.3.ends <- bind_rows(data.100.3.ends %>% 
+            bind_rows(.id = "threshold"), 
+          data.200.3.ends %>% 
+            bind_rows(.id = "threshold"), 
+          data.500.3.ends %>% 
+            bind_rows(.id = "threshold") ,
+          .id = "num.genes") %>% 
+  filter(threshold %in% c(0.005, 0.05, 0.1)) %>% 
+  mutate(num.genes = recode(num.genes, `1` = "100 Genes", `2` = "200 Genes", `3` = "500 Genes")) %>% 
+  select(num.genes, threshold, groups) %>% 
+  distinct() %>% 
+  group_by(num.genes, threshold) %>% 
+  summarize(num.groups = n())
+
+plot.num.blocks.3.ends <- ggplot(num.blocks.3.ends, aes(x = threshold, y = num.groups)) + 
+  geom_col() + 
+  facet_wrap(~num.genes) + 
+  labs(title = "3' Read Ends", 
+       x = "Threshold", y = "Number of Blocks") + 
+  theme(text = element_text(size = 16), axis.text = element_text(size = 16))
+
+## ggsave("num_blocks_3_ends.png", plot.num.blocks.3.ends, width = 9, height = 5, dpi = "retina")
+```
+
+Arrange plots
+```{r}
+ggarrange(plot.num.blocks.5.ends, plot.num.blocks.3.ends, 
+          nrow = 2, ncol = 1)
+
+## ggsave("num_blocks.png", width = 9, height = 7, dpi = "retina")
+```

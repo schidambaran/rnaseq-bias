@@ -1,0 +1,705 @@
+---
+title: "Secondary Structure Analysis"
+author: "Sadhana Chidambaran"
+output: html_document
+---
+
+```{r echo = FALSE}
+knitr::opts_chunk$set(fig.align = "center", warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r, message = FALSE}
+library(ggpubr)
+library(tidyverse)
+```
+
+### Create all functions
+
+Function to reformat RNAfold results
+```{r}
+rnafold.reformat <- function(data) {
+  
+  data %>% 
+    mutate(gene = gsub(">", "", gene)) %>%
+    separate(fold_info, into = c("a", "b"), sep = " \\(", remove = FALSE) %>% 
+    mutate(fold.energy = as.numeric(str_remove(b, "\\)"))) %>% 
+    dplyr::rename("fold.structure" = "a") %>% 
+    select(-c("fold_info", "b"))
+  
+}
+```
+
+Initialize vectors for all thresholds and bases
+```{r}
+thresholds <- c(0.005, 0.05, 0.1)
+names(thresholds) <- thresholds
+```
+
+Function for Kolmogorov–Smirnov tests
+```{r}
+ks.test.func <- function(data) {
+  
+  # Iterate over all thresholds
+  lapply(thresholds, function(x) {
+    
+    # Filter for sequences that start with a particular base, at a particular threshold for low fragmentation
+    filtered.data <- data %>%
+      filter(threshold == x)
+    
+    seq.data <- filtered.data %>% 
+      filter(source == "seq")
+    
+    rand.data <- filtered.data %>% 
+      filter(source == "rand")
+    
+    # KS test to determine if folding energy distribution is less in regions of low fragmentation vs. randomly selected sequences
+    ks <- ks.test(seq.data$fold.energy, rand.data$fold.energy, alternative = "greater")
+    
+    # Round p-values to 5 decimal places
+    ks$p.value %>% 
+      format(digits = 5, nsmall = 5)
+    }) %>% 
+    unlist() %>% 
+    as.data.frame() %>% 
+    rownames_to_column() %>% 
+    dplyr::rename("threshold" = "rowname", "p.value" = ".")
+}
+```
+
+### Run RNAfold on all the data for the 100 most expressed genes
+
+Run RNAfold on all sequences (those from regions of low fragmentation and those that were randomly selected)
+```{bash}
+# Run RNAfold
+for file in /data/sadhana/rnaseq_bias/fastas/100_genes/*.fasta; do
+
+  name=`echo $file | cut -d '/' -f 7`
+  path=/data/sadhana/rnaseq_bias/secondary_structure_analysis/100_genes/output/${name%.*}
+  
+  RNAfold --noPS $file > $path\.out
+  
+done
+
+# Convert RNAfold output to CSVs
+for file in /data/sadhana/rnaseq_bias/secondary_structure_analysis/100_genes/output/*.out; do
+
+  name=`echo $file | cut -d '/' -f 8`
+  path=/data/sadhana/rnaseq_bias/secondary_structure_analysis/100_genes/csvs/${name%.*}
+  
+  echo "gene,sequence,fold_info" > $path.csv
+  while read one; read two; read three
+  do
+    echo "$one","$two","$three"
+  done < $file >> $path.csv
+  
+done
+```
+
+### Get RNAfold results for the 100 most expressed genes
+
+Read in RNAfold results
+```{r, message = FALSE}
+# Get all output files
+rnafold.files.100.edges <- grep("edge", 
+                                dir("/data/sadhana/rnaseq_bias/secondary_structure_analysis/100_genes/csvs", 
+                                    full.names = TRUE), 
+                                value = TRUE)
+names(rnafold.files.100.edges) <- lapply(rnafold.files.100.edges, function(filename) {
+  filename <- str_split(filename, "/")[[1]][8] %>% 
+    gsub(".csv", "", .)
+  str_split(filename, "_")[[1]][5]
+}) %>% 
+  unlist()
+
+rnafold.files.100.seqs <- setdiff(dir("/data/sadhana/rnaseq_bias/secondary_structure_analysis/100_genes/csvs", 
+                                      full.names = TRUE), 
+                                  rnafold.files.100.edges)
+names(rnafold.files.100.seqs) <- lapply(rnafold.files.100.seqs, function(filename) {
+  filename <- str_split(filename, "/")[[1]][8] %>% 
+    gsub(".csv", "", .)
+  str_split(filename, "_")[[1]][4]
+}) %>% 
+  unlist()
+
+# Read in all output files
+rnafold.100.seqs.5.end <- lapply(grep("seqs_5_ends", rnafold.files.100.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.100.seqs.3.end <- lapply(grep("seqs_3_ends", rnafold.files.100.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.100.rand.5.end <- lapply(grep("rand_5_ends", rnafold.files.100.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.100.rand.3.end <- lapply(grep("rand_3_ends", rnafold.files.100.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+
+rnafold.100.seqs.5.edge <- lapply(grep("seqs_5_ends", rnafold.files.100.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.100.seqs.3.edge <- lapply(grep("seqs_3_ends", rnafold.files.100.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.100.rand.5.edge <- lapply(grep("rand_5_ends", rnafold.files.100.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.100.rand.3.edge <- lapply(grep("rand_3_ends", rnafold.files.100.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+```
+
+Reformat RNAfold results
+```{r}
+rnafold.100.seqs.5.end <- lapply(rnafold.100.seqs.5.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.100.seqs.3.end <- lapply(rnafold.100.seqs.3.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.100.rand.5.end <- lapply(rnafold.100.rand.5.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+
+rnafold.100.rand.3.end <- lapply(rnafold.100.rand.3.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+
+rnafold.100.seqs.5.edge <- lapply(rnafold.100.seqs.5.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.100.seqs.3.edge <- lapply(rnafold.100.seqs.3.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.100.rand.5.edge <- lapply(rnafold.100.rand.5.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+
+rnafold.100.rand.3.edge <- lapply(rnafold.100.rand.3.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+```
+
+### Generate box plots for folding energy distributions
+
+```{r}
+# Combine RNAfold results for 5' read ends
+rnafold.100.5.data <- rbind(rnafold.100.seqs.5.end, rnafold.100.rand.5.end) %>% 
+  mutate(seq.start = substr(sequence, 1, 1)) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.100.5.data$source <- factor(rnafold.100.5.data$source , levels = c("seq", "rand"))
+
+# Combine RNAfold results for 3' read ends
+rnafold.100.3.data <- rbind(rnafold.100.seqs.3.end, rnafold.100.rand.3.end) %>% 
+  mutate(seq.end = substr(sequence, nchar(sequence), nchar(sequence))) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.100.3.data$source <- factor(rnafold.100.3.data$source , levels = c("seq", "rand"))
+
+# Combine RNAfold results for 5' edges
+rnafold.100.5.data.edges <- rbind(rnafold.100.seqs.5.edge, rnafold.100.rand.5.edge) %>% 
+  mutate(seq.start = substr(sequence, 1, 1)) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.100.5.data.edges$source <- factor(rnafold.100.5.data.edges$source , levels = c("seq", "rand"))
+
+# Combine RNAfold results for 3' edges
+rnafold.100.3.data.edges <- rbind(rnafold.100.seqs.3.edge, rnafold.100.rand.3.edge) %>% 
+  mutate(seq.end = substr(sequence, nchar(sequence), nchar(sequence))) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.100.3.data.edges$source <- factor(rnafold.100.3.data.edges$source , levels = c("seq", "rand"))
+```
+
+Generate box plots for folding energy distributions (5' read ends)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.100.5.ks <- ks.test.func(rnafold.100.5.data)
+
+plot.100.genes.5 <- ggplot(rnafold.100.5.data, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "100 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("Blocks", "Random sequences")) + 
+  geom_text(data = rnafold.100.5.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_100_5_ends.png", width = 9, height = 5)
+```
+
+Generate box plots for folding energy distributions (3' read ends)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.100.3.ks <- ks.test.func(rnafold.100.3.data)
+
+plot.100.genes.3 <- ggplot(rnafold.100.3.data, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "100 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("Blocks", "Random sequences")) + 
+  geom_text(data = rnafold.100.3.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_100_3_ends.png", width = 9, height = 5)
+```
+
+Generate box plots for folding energy distributions (5' edges)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.100.5.edges.ks <- ks.test.func(rnafold.100.5.data.edges)
+
+plot.100.genes.5.edges <- ggplot(rnafold.100.5.data.edges, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "100 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("5' Edges", "Random sequences")) + 
+  geom_text(data = rnafold.100.5.edges.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_100_5_edges.png", width = 9, height = 5)
+```
+
+Generate box plots for folding energy distributions (3' edges)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.100.3.edges.ks <- ks.test.func(rnafold.100.3.data.edges)
+
+plot.100.genes.3.edges <- ggplot(rnafold.100.3.data.edges, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "100 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("3' Edges", "Random sequences")) + 
+  geom_text(data = rnafold.100.3.edges.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_100_3_edges.png", width = 9, height = 5)
+```
+
+### Run RNAfold on all the data for the 200 most expressed genes
+
+Run RNAfold on all sequences (those from regions of low fragmentation and those that were randomly selected)
+```{bash}
+# Run RNAfold
+for file in /data/sadhana/rnaseq_bias/fastas/200_genes/*.fasta; do
+
+  name=`echo $file | cut -d '/' -f 7`
+  path=/data/sadhana/rnaseq_bias/secondary_structure_analysis/200_genes/output/${name%.*}
+  
+  RNAfold --noPS $file > $path\.out
+  
+done
+
+# Convert RNAfold output to CSVs
+for file in /data/sadhana/rnaseq_bias/secondary_structure_analysis/200_genes/output/*.out; do
+
+  name=`echo $file | cut -d '/' -f 8`
+  path=/data/sadhana/rnaseq_bias/secondary_structure_analysis/200_genes/csvs/${name%.*}
+  
+  echo "gene,sequence,fold_info" > $path.csv
+  while read one; read two; read three
+  do
+    echo "$one","$two","$three"
+  done < $file >> $path.csv
+  
+done
+```
+
+### Get RNAfold results for the 200 most expressed genes
+
+Read in RNAfold results
+```{r, message = FALSE}
+# Get all output files
+rnafold.files.200.edges <- grep("edge", 
+                                dir("/data/sadhana/rnaseq_bias/secondary_structure_analysis/200_genes/csvs", 
+                                    full.names = TRUE), 
+                                value = TRUE)
+names(rnafold.files.200.edges) <- lapply(rnafold.files.200.edges, function(filename) {
+  filename <- str_split(filename, "/")[[1]][8] %>% 
+    gsub(".csv", "", .)
+  str_split(filename, "_")[[1]][5]
+}) %>% 
+  unlist()
+
+rnafold.files.200.seqs <- setdiff(dir("/data/sadhana/rnaseq_bias/secondary_structure_analysis/200_genes/csvs", 
+                                      full.names = TRUE), 
+                                  rnafold.files.200.edges)
+names(rnafold.files.200.seqs) <- lapply(rnafold.files.200.seqs, function(filename) {
+  filename <- str_split(filename, "/")[[1]][8] %>% 
+    gsub(".csv", "", .)
+  str_split(filename, "_")[[1]][4]
+}) %>% 
+  unlist()
+
+# Read in all output files
+rnafold.200.seqs.5.end <- lapply(grep("seqs_5_ends", rnafold.files.200.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.200.seqs.3.end <- lapply(grep("seqs_3_ends", rnafold.files.200.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.200.rand.5.end <- lapply(grep("rand_5_ends", rnafold.files.200.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.200.rand.3.end <- lapply(grep("rand_3_ends", rnafold.files.200.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+
+rnafold.200.seqs.5.edge <- lapply(grep("seqs_5_ends", rnafold.files.200.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.200.seqs.3.edge <- lapply(grep("seqs_3_ends", rnafold.files.200.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.200.rand.5.edge <- lapply(grep("rand_5_ends", rnafold.files.200.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.200.rand.3.edge <- lapply(grep("rand_3_ends", rnafold.files.200.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+```
+
+Reformat RNAfold results
+```{r}
+rnafold.200.seqs.5.end <- lapply(rnafold.200.seqs.5.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.200.seqs.3.end <- lapply(rnafold.200.seqs.3.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.200.rand.5.end <- lapply(rnafold.200.rand.5.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+
+rnafold.200.rand.3.end <- lapply(rnafold.200.rand.3.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+
+rnafold.200.seqs.5.edge <- lapply(rnafold.200.seqs.5.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.200.seqs.3.edge <- lapply(rnafold.200.seqs.3.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.200.rand.5.edge <- lapply(rnafold.200.rand.5.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+
+rnafold.200.rand.3.edge <- lapply(rnafold.200.rand.3.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+```
+
+### Generate box plots for folding energy distributions
+
+```{r}
+# Combine RNAfold results for 5' read ends
+rnafold.200.5.data <- rbind(rnafold.200.seqs.5.end, rnafold.200.rand.5.end) %>% 
+  mutate(seq.start = substr(sequence, 1, 1)) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.200.5.data$source <- factor(rnafold.200.5.data$source , levels = c("seq", "rand"))
+
+# Combine RNAfold results for 3' read ends
+rnafold.200.3.data <- rbind(rnafold.200.seqs.3.end, rnafold.200.rand.3.end) %>% 
+  mutate(seq.end = substr(sequence, nchar(sequence), nchar(sequence))) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.200.3.data$source <- factor(rnafold.200.3.data$source , levels = c("seq", "rand"))
+
+# Combine RNAfold results for 5' edges
+rnafold.200.5.data.edges <- rbind(rnafold.200.seqs.5.edge, rnafold.200.rand.5.edge) %>% 
+  mutate(seq.start = substr(sequence, 1, 1)) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.200.5.data.edges$source <- factor(rnafold.200.5.data.edges$source , levels = c("seq", "rand"))
+
+# Combine RNAfold results for 3' edges
+rnafold.200.3.data.edges <- rbind(rnafold.200.seqs.3.edge, rnafold.200.rand.3.edge) %>% 
+  mutate(seq.end = substr(sequence, nchar(sequence), nchar(sequence))) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.200.3.data.edges$source <- factor(rnafold.200.3.data.edges$source , levels = c("seq", "rand"))
+```
+
+Generate box plots for folding energy distributions (5' read ends)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.200.5.ks <- ks.test.func(rnafold.200.5.data)
+
+plot.200.genes.5 <- ggplot(rnafold.200.5.data, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "200 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("Blocks", "Random sequences")) + 
+  geom_text(data = rnafold.200.5.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_200_5_ends.png", width = 9, height = 5)
+```
+
+Generate box plots for folding energy distributions (3' read ends)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.200.3.ks <- ks.test.func(rnafold.200.3.data)
+
+plot.200.genes.3 <- ggplot(rnafold.200.3.data, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "200 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("Blocks", "Random sequences")) + 
+  geom_text(data = rnafold.200.3.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_200_3_ends.png", width = 9, height = 5)
+```
+
+Generate box plots for folding energy distributions (5' edges)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.200.5.edges.ks <- ks.test.func(rnafold.200.5.data.edges)
+
+plot.200.genes.5.edges <- ggplot(rnafold.200.5.data.edges, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "200 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("5' Edges", "Random sequences")) + 
+  geom_text(data = rnafold.200.5.edges.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_200_5_edges.png", width = 9, height = 5)
+```
+
+Generate box plots for folding energy distributions (3' edges)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.200.3.edges.ks <- ks.test.func(rnafold.200.3.data.edges)
+
+plot.200.genes.3.edges <- ggplot(rnafold.200.3.data.edges, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "200 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("3' Edges", "Random sequences")) + 
+  geom_text(data = rnafold.200.3.edges.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_200_3_edges.png", width = 9, height = 5)
+```
+
+### Run RNAfold on all the data for the 500 most expressed genes
+
+Run RNAfold on all sequences (those from regions of low fragmentation and those that were randomly selected)
+```{bash}
+# Run RNAfold
+for file in /data/sadhana/rnaseq_bias/fastas/500_genes/*.fasta; do
+
+  name=`echo $file | cut -d '/' -f 7`
+  path=/data/sadhana/rnaseq_bias/secondary_structure_analysis/500_genes/output/${name%.*}
+  
+  RNAfold --noPS $file > $path\.out
+  
+done
+
+# Convert RNAfold output to CSVs
+for file in /data/sadhana/rnaseq_bias/secondary_structure_analysis/500_genes/output/*.out; do
+
+  name=`echo $file | cut -d '/' -f 8`
+  path=/data/sadhana/rnaseq_bias/secondary_structure_analysis/500_genes/csvs/${name%.*}
+  
+  echo "gene,sequence,fold_info" > $path.csv
+  while read one; read two; read three
+  do
+    echo "$one","$two","$three"
+  done < $file >> $path.csv
+  
+done
+```
+
+### Get RNAfold results for the 500 most expressed genes
+
+Read in RNAfold results
+```{r, message = FALSE}
+# Get all output files
+rnafold.files.500.edges <- grep("edge", 
+                                dir("/data/sadhana/rnaseq_bias/secondary_structure_analysis/500_genes/csvs", 
+                                    full.names = TRUE), 
+                                value = TRUE)
+names(rnafold.files.500.edges) <- lapply(rnafold.files.500.edges, function(filename) {
+  filename <- str_split(filename, "/")[[1]][8] %>% 
+    gsub(".csv", "", .)
+  str_split(filename, "_")[[1]][5]
+}) %>% 
+  unlist()
+
+rnafold.files.500.seqs <- setdiff(dir("/data/sadhana/rnaseq_bias/secondary_structure_analysis/500_genes/csvs", 
+                                      full.names = TRUE), 
+                                  rnafold.files.500.edges)
+names(rnafold.files.500.seqs) <- lapply(rnafold.files.500.seqs, function(filename) {
+  filename <- str_split(filename, "/")[[1]][8] %>% 
+    gsub(".csv", "", .)
+  str_split(filename, "_")[[1]][4]
+}) %>% 
+  unlist()
+
+# Read in all output files
+rnafold.500.seqs.5.end <- lapply(grep("seqs_5_ends", rnafold.files.500.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.500.seqs.3.end <- lapply(grep("seqs_3_ends", rnafold.files.500.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.500.rand.5.end <- lapply(grep("rand_5_ends", rnafold.files.500.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.500.rand.3.end <- lapply(grep("rand_3_ends", rnafold.files.500.seqs, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+
+rnafold.500.seqs.5.edge <- lapply(grep("seqs_5_ends", rnafold.files.500.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.500.seqs.3.edge <- lapply(grep("seqs_3_ends", rnafold.files.500.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.500.rand.5.edge <- lapply(grep("rand_5_ends", rnafold.files.500.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+rnafold.500.rand.3.edge <- lapply(grep("rand_3_ends", rnafold.files.500.edges, value = TRUE), 
+                             function(x) { read_csv(x, col_names = TRUE) })
+```
+
+Reformat RNAfold results
+```{r}
+rnafold.500.seqs.5.end <- lapply(rnafold.500.seqs.5.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.500.seqs.3.end <- lapply(rnafold.500.seqs.3.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.500.rand.5.end <- lapply(rnafold.500.rand.5.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+
+rnafold.500.rand.3.end <- lapply(rnafold.500.rand.3.end, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+
+rnafold.500.seqs.5.edge <- lapply(rnafold.500.seqs.5.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.500.seqs.3.edge <- lapply(rnafold.500.seqs.3.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "seq")
+
+rnafold.500.rand.5.edge <- lapply(rnafold.500.rand.5.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+
+rnafold.500.rand.3.edge <- lapply(rnafold.500.rand.3.edge, rnafold.reformat) %>% 
+  bind_rows(.id = "threshold") %>% 
+  mutate(source = "rand")
+```
+
+### Generate box plots for folding energy distributions
+
+```{r}
+# Combine RNAfold results for 5' read ends
+rnafold.500.5.data <- rbind(rnafold.500.seqs.5.end, rnafold.500.rand.5.end) %>% 
+  mutate(seq.start = substr(sequence, 1, 1)) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.500.5.data$source <- factor(rnafold.500.5.data$source , levels = c("seq", "rand"))
+
+# Combine RNAfold results for 3' read ends
+rnafold.500.3.data <- rbind(rnafold.500.seqs.3.end, rnafold.500.rand.3.end) %>% 
+  mutate(seq.end = substr(sequence, nchar(sequence), nchar(sequence))) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.500.3.data$source <- factor(rnafold.500.3.data$source , levels = c("seq", "rand"))
+
+# Combine RNAfold results for 5' edges
+rnafold.500.5.data.edges <- rbind(rnafold.500.seqs.5.edge, rnafold.500.rand.5.edge) %>% 
+  mutate(seq.start = substr(sequence, 1, 1)) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.500.5.data.edges$source <- factor(rnafold.500.5.data.edges$source , levels = c("seq", "rand"))
+
+# Combine RNAfold results for 3' edges
+rnafold.500.3.data.edges <- rbind(rnafold.500.seqs.3.edge, rnafold.500.rand.3.edge) %>% 
+  mutate(seq.end = substr(sequence, nchar(sequence), nchar(sequence))) %>% 
+  filter(threshold %in% c("0.005", "0.05", "0.1"))
+rnafold.500.3.data.edges$source <- factor(rnafold.500.3.data.edges$source , levels = c("seq", "rand"))
+```
+
+Generate box plots for folding energy distributions (5' read ends)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.500.5.ks <- ks.test.func(rnafold.500.5.data)
+
+plot.500.genes.5 <- ggplot(rnafold.500.5.data, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "500 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("Blocks", "Random sequences")) + 
+  geom_text(data = rnafold.500.5.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_500_5_ends.png", width = 9, height = 5)
+```
+
+Generate box plots for folding energy distributions (3' read ends)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.500.3.ks <- ks.test.func(rnafold.500.3.data)
+
+plot.500.genes.3 <- ggplot(rnafold.500.3.data, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "500 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("Blocks", "Random sequences")) + 
+  geom_text(data = rnafold.500.3.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_500_3_ends.png", width = 9, height = 5)
+```
+
+Generate box plots for folding energy distributions (5' edges)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.500.5.edges.ks <- ks.test.func(rnafold.500.5.data.edges)
+
+plot.500.genes.5.edges <- ggplot(rnafold.500.5.data.edges, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "500 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("5' Edges", "Random sequences")) + 
+  geom_text(data = rnafold.500.5.edges.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_500_5_edges.png", width = 9, height = 5)
+```
+
+Generate box plots for folding energy distributions (3' edges)
+```{r, warning = FALSE, fig.width = 9, fig.height = 5}
+# Conduct KS tests between folding energy distributions of regions of low fragmentation and randomly selected sequences
+rnafold.500.3.edges.ks <- ks.test.func(rnafold.500.3.data.edges)
+
+plot.500.genes.3.edges <- ggplot(rnafold.500.3.data.edges, aes(x = threshold, y = fold.energy)) + 
+  geom_boxplot(aes(fill = source)) + 
+  labs(title = "500 most expressed genes", x = "Threshold", y = "Free energy (kcal/mol)") + 
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size = 12), 
+        text = element_text(size = 12), axis.text = element_text(size = 12)) + 
+  scale_fill_discrete(labels = c("3' Edges", "Random sequences")) + 
+  geom_text(data = rnafold.500.3.edges.ks, mapping = aes(x = threshold, y = 0.5, label = p.value), inherit.aes = FALSE, size = 4) + 
+  ylim(-13, 1)
+
+ggsave("rnafold_500_3_edges.png", width = 9, height = 5)
+```
+
+### Arrange box plots
+
+```{r}
+ggarrange(plot.100.genes.5, plot.200.genes.5, plot.500.genes.5, 
+          nrow = 1, ncol = 3, common.legend = TRUE, legend = "bottom")
+
+ggsave("rnafold_blocks.png", width = 12, height = 5, dpi = "retina")
+
+ggarrange(plot.100.genes.5.edges, plot.200.genes.5.edges, plot.500.genes.5.edges, 
+          nrow = 1, ncol = 3, common.legend = TRUE, legend = "bottom")
+
+ggsave("rnafold_5_edges.png", width = 12, height = 5, dpi = "retina")
+
+ggarrange(plot.100.genes.3.edges, plot.200.genes.3.edges, plot.500.genes.3.edges, 
+          nrow = 1, ncol = 3, common.legend = TRUE, legend = "bottom")
+
+ggsave("rnafold_3_edges.png", width = 12, height = 5, dpi = "retina")
+```
